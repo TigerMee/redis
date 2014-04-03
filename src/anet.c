@@ -234,11 +234,12 @@ static int anetCreateSocket(char *err, int domain) {
 
 #define ANET_CONNECT_NONE 0
 #define ANET_CONNECT_NONBLOCK 1
-static int anetTcpGenericConnect(char *err, char *addr, int port, int flags)
+static int anetTcpGenericConnect(char *err, char *addr, int port,
+                                 char *source_addr, int flags)
 {
     int s = ANET_ERR, rv;
     char portstr[6];  /* strlen("65535") + 1; */
-    struct addrinfo hints, *servinfo, *p;
+    struct addrinfo hints, *servinfo, *bservinfo, *p, *b;
 
     snprintf(portstr,sizeof(portstr),"%d",port);
     memset(&hints,0,sizeof(hints));
@@ -258,6 +259,24 @@ static int anetTcpGenericConnect(char *err, char *addr, int port, int flags)
         if (anetSetReuseAddr(err,s) == ANET_ERR) goto error;
         if (flags & ANET_CONNECT_NONBLOCK && anetNonBlock(err,s) != ANET_OK)
             goto error;
+        if (source_addr) {
+            int bound = 0;
+            /* Using getaddrinfo saves us from self-determining IPv4 vs IPv6 */
+            if ((rv = getaddrinfo(source_addr, NULL, &hints, &bservinfo)) != 0) {
+                anetSetError(err, "%s", gai_strerror(rv));
+                goto end;
+            }
+            for (b = bservinfo; b != NULL; b = b->ai_next) {
+                if (bind(s,b->ai_addr,b->ai_addrlen) != -1) {
+                    bound = 1;
+                    break;
+                }
+            }
+            if (!bound) {
+                anetSetError(err, "bind: %s", strerror(errno));
+                goto end;
+            }
+        }
         if (connect(s,p->ai_addr,p->ai_addrlen) == -1) {
             /* If the socket is non-blocking, it is ok for connect() to
              * return an EINPROGRESS error here. */
@@ -287,12 +306,17 @@ end:
 
 int anetTcpConnect(char *err, char *addr, int port)
 {
-    return anetTcpGenericConnect(err,addr,port,ANET_CONNECT_NONE);
+    return anetTcpGenericConnect(err,addr,port,NULL,ANET_CONNECT_NONE);
 }
 
 int anetTcpNonBlockConnect(char *err, char *addr, int port)
 {
-    return anetTcpGenericConnect(err,addr,port,ANET_CONNECT_NONBLOCK);
+    return anetTcpGenericConnect(err,addr,port,NULL,ANET_CONNECT_NONBLOCK);
+}
+
+int anetTcpNonBlockBindConnect(char *err, char *addr, int port, char *source_addr)
+{
+    return anetTcpGenericConnect(err,addr,port,source_addr,ANET_CONNECT_NONBLOCK);
 }
 
 int anetUnixGenericConnect(char *err, char *path, int flags)
@@ -361,17 +385,14 @@ int anetWrite(int fd, char *buf, int count)
     return totlen;
 }
 
-static int anetListen(char *err, int s, struct sockaddr *sa, socklen_t len) {
+static int anetListen(char *err, int s, struct sockaddr *sa, socklen_t len, int backlog) {
     if (bind(s,sa,len) == -1) {
         anetSetError(err, "bind: %s", strerror(errno));
         close(s);
         return ANET_ERR;
     }
 
-    /* Use a backlog of 512 entries. We pass 511 to the listen() call because
-     * the kernel does: backlogsize = roundup_pow_of_two(backlogsize + 1);
-     * which will thus give us a backlog of 512 entries */
-    if (listen(s, 511) == -1) {
+    if (listen(s, backlog) == -1) {
         anetSetError(err, "listen: %s", strerror(errno));
         close(s);
         return ANET_ERR;
@@ -389,7 +410,7 @@ static int anetV6Only(char *err, int s) {
     return ANET_OK;
 }
 
-static int _anetTcpServer(char *err, int port, char *bindaddr, int af)
+static int _anetTcpServer(char *err, int port, char *bindaddr, int af, int backlog)
 {
     int s, rv;
     char _port[6];  /* strlen("65535") */
@@ -411,7 +432,7 @@ static int _anetTcpServer(char *err, int port, char *bindaddr, int af)
 
         if (af == AF_INET6 && anetV6Only(err,s) == ANET_ERR) goto error;
         if (anetSetReuseAddr(err,s) == ANET_ERR) goto error;
-        if (anetListen(err,s,p->ai_addr,p->ai_addrlen) == ANET_ERR) goto error;
+        if (anetListen(err,s,p->ai_addr,p->ai_addrlen,backlog) == ANET_ERR) goto error;
         goto end;
     }
     if (p == NULL) {
@@ -426,17 +447,17 @@ end:
     return s;
 }
 
-int anetTcpServer(char *err, int port, char *bindaddr)
+int anetTcpServer(char *err, int port, char *bindaddr, int backlog)
 {
-    return _anetTcpServer(err, port, bindaddr, AF_INET);
+    return _anetTcpServer(err, port, bindaddr, AF_INET, backlog);
 }
 
-int anetTcp6Server(char *err, int port, char *bindaddr)
+int anetTcp6Server(char *err, int port, char *bindaddr, int backlog)
 {
-    return _anetTcpServer(err, port, bindaddr, AF_INET6);
+    return _anetTcpServer(err, port, bindaddr, AF_INET6, backlog);
 }
 
-int anetUnixServer(char *err, char *path, mode_t perm)
+int anetUnixServer(char *err, char *path, mode_t perm, int backlog)
 {
     int s;
     struct sockaddr_un sa;
@@ -447,7 +468,7 @@ int anetUnixServer(char *err, char *path, mode_t perm)
     memset(&sa,0,sizeof(sa));
     sa.sun_family = AF_LOCAL;
     strncpy(sa.sun_path,path,sizeof(sa.sun_path)-1);
-    if (anetListen(err,s,(struct sockaddr*)&sa,sizeof(sa)) == ANET_ERR)
+    if (anetListen(err,s,(struct sockaddr*)&sa,sizeof(sa),backlog) == ANET_ERR)
         return ANET_ERR;
     if (perm)
         chmod(sa.sun_path, perm);

@@ -613,9 +613,11 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         return;
     }
     if ((nwritten = write(fd,buf,buflen)) == -1) {
-        redisLog(REDIS_VERBOSE,"Write error sending DB to slave: %s",
-            strerror(errno));
-        freeClient(slave);
+        if (errno != EAGAIN) {
+            redisLog(REDIS_WARNING,"Write error sending DB to slave: %s",
+                strerror(errno));
+            freeClient(slave);
+        }
         return;
     }
     slave->repldboff += nwritten;
@@ -627,6 +629,7 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         slave->repl_ack_time = server.unixtime;
         if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE,
             sendReplyToClient, slave) == AE_ERR) {
+            redisLog(REDIS_WARNING,"Unable to register writable event for slave bulk transfer: %s", strerror(errno));
             freeClient(slave);
             return;
         }
@@ -1261,6 +1264,7 @@ void replicationSetMaster(char *ip, int port) {
     cancelReplicationHandshake();
     server.repl_state = REDIS_REPL_CONNECT;
     server.master_repl_offset = 0;
+    server.repl_down_since = 0;
 }
 
 /* Cancel replication, setting the instance as a master itself. */
@@ -1669,6 +1673,26 @@ void processClientsWaitingReplicas(void) {
             }
         }
     }
+}
+
+/* Return the slave replication offset for this instance, that is
+ * the offset for which we already processed the master replication stream. */
+long long replicationGetSlaveOffset(void) {
+    long long offset = 0;
+
+    if (server.masterhost != NULL) {
+        if (server.master) {
+            offset = server.master->reploff;
+        } else if (server.cached_master) {
+            offset = server.cached_master->reploff;
+        }
+    }
+    /* offset may be -1 when the master does not support it at all, however
+     * this function is designed to return an offset that can express the
+     * amount of data processed by the master, so we return a positive
+     * integer. */
+    if (offset < 0) offset = 0;
+    return offset;
 }
 
 /* --------------------------- REPLICATION CRON  ---------------------------- */

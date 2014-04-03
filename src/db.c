@@ -50,7 +50,7 @@ robj *lookupKey(redisDb *db, robj *key) {
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
         if (server.rdb_child_pid == -1 && server.aof_child_pid == -1)
-            val->lru = server.lruclock;
+            val->lru = LRU_CLOCK();
         return val;
     } else {
         return NULL;
@@ -104,7 +104,7 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
  *
  * The program is aborted if the key was not already present. */
 void dbOverwrite(redisDb *db, robj *key, robj *val) {
-    struct dictEntry *de = dictFind(db->dict,key->ptr);
+    dictEntry *de = dictFind(db->dict,key->ptr);
     
     redisAssertWithInfo(NULL,key,de != NULL);
     dictReplace(db->dict, key->ptr, val);
@@ -136,7 +136,7 @@ int dbExists(redisDb *db, robj *key) {
  *
  * The function makes sure to return keys not already expired. */
 robj *dbRandomKey(redisDb *db) {
-    struct dictEntry *de;
+    dictEntry *de;
 
     while(1) {
         sds key;
@@ -168,6 +168,44 @@ int dbDelete(redisDb *db, robj *key) {
     } else {
         return 0;
     }
+}
+
+/* Prepare the string object stored at 'key' to be modified destructively
+ * to implement commands like SETBIT or APPEND.
+ *
+ * An object is usually ready to be modified unless one of the two conditions
+ * are true:
+ *
+ * 1) The object 'o' is shared (refcount > 1), we don't want to affect
+ *    other users.
+ * 2) The object encoding is not "RAW".
+ *
+ * If the object is found in one of the above conditions (or both) by the
+ * function, an unshared / not-encoded copy of the string object is stored
+ * at 'key' in the specified 'db'. Otherwise the object 'o' itself is
+ * returned.
+ *
+ * USAGE:
+ *
+ * The object 'o' is what the caller already obtained by looking up 'key'
+ * in 'db', the usage pattern looks like this:
+ *
+ * o = lookupKeyWrite(db,key);
+ * if (checkType(c,o,REDIS_STRING)) return;
+ * o = dbUnshareStringValue(db,key,o);
+ *
+ * At this point the caller is ready to modify the object, for example
+ * using an sdscat() call to append some data, or anything else.
+ */
+robj *dbUnshareStringValue(redisDb *db, robj *key, robj *o) {
+    redisAssert(o->type == REDIS_STRING);
+    if (o->refcount != 1 || o->encoding != REDIS_ENCODING_RAW) {
+        robj *decoded = getDecodedObject(o);
+        o = createRawStringObject(decoded->ptr, sdslen(decoded->ptr));
+        decrRefCount(decoded);
+        dbOverwrite(db,key,o);
+    }
+    return o;
 }
 
 long long emptyDb(void(callback)(void*)) {
@@ -605,11 +643,13 @@ void shutdownCommand(redisClient *c) {
             return;
         }
     }
-    /* SHUTDOWN can be called even while the server is in "loading" state.
-     * When this happens we need to make sure no attempt is performed to save
+    /* When SHUTDOWN is called while the server is loading a dataset in
+     * memory we need to make sure no attempt is performed to save
      * the dataset on shutdown (otherwise it could overwrite the current DB
-     * with half-read data). */
-    if (server.loading)
+     * with half-read data).
+     *
+     * Also when in Sentinel mode clear the SAVE flag and force NOSAVE. */
+    if (server.loading || server.sentinel_mode)
         flags = (flags & ~REDIS_SHUTDOWN_SAVE) | REDIS_SHUTDOWN_NOSAVE;
     if (prepareForShutdown(flags) == REDIS_OK) exit(0);
     addReplyError(c,"Errors trying to SHUTDOWN. Check logs.");
@@ -770,12 +810,20 @@ void propagateExpire(redisDb *db, robj *key) {
 }
 
 int expireIfNeeded(redisDb *db, robj *key) {
-    long long when = getExpire(db,key);
+    mstime_t when = getExpire(db,key);
+    mstime_t now;
 
     if (when < 0) return 0; /* No expire for this key */
 
     /* Don't expire anything while loading. It will be done later. */
     if (server.loading) return 0;
+
+    /* If we are in the context of a Lua script, we claim that time is
+     * blocked to when the Lua script started. This way a key can expire
+     * only the first time it is accessed and not in the middle of the
+     * script execution, making propagation to slaves / AOF consistent.
+     * See issue #1525 on Github for more information. */
+    now = server.lua_caller ? server.lua_time_start : mstime();
 
     /* If we are running in the context of a slave, return ASAP:
      * the slave key expiration is controlled by the master that will
@@ -784,12 +832,10 @@ int expireIfNeeded(redisDb *db, robj *key) {
      * Still we try to return the right information to the caller, 
      * that is, 0 if we think the key should be still valid, 1 if
      * we think the key is expired at this time. */
-    if (server.masterhost != NULL) {
-        return mstime() > when;
-    }
+    if (server.masterhost != NULL) return now > when;
 
     /* Return when this key has not expired */
-    if (mstime() <= when) return 0;
+    if (now <= when) return 0;
 
     /* Delete the key */
     server.stat_expiredkeys++;
@@ -922,6 +968,8 @@ void persistCommand(redisClient *c) {
  * API to get key arguments from commands
  * ---------------------------------------------------------------------------*/
 
+/* The base case is to use the keys position as given in the command table
+ * (firstkey, lastkey, step). */
 int *getKeysUsingCommandTable(struct redisCommand *cmd,robj **argv, int argc, int *numkeys) {
     int j, i = 0, last, *keys;
     REDIS_NOTUSED(argv);
@@ -941,42 +989,36 @@ int *getKeysUsingCommandTable(struct redisCommand *cmd,robj **argv, int argc, in
     return keys;
 }
 
-int *getKeysFromCommand(struct redisCommand *cmd,robj **argv, int argc, int *numkeys, int flags) {
+/* Return all the arguments that are keys in the command passed via argc / argv.
+ *
+ * The command returns the positions of all the key arguments inside the array,
+ * so the actual return value is an heap allocated array of integers. The
+ * length of the array is returned by reference into *numkeys.
+ *
+ * 'cmd' must be point to the corresponding entry into the redisCommand
+ * table, according to the command name in argv[0].
+ *
+ * This function uses the command table if a command-specific helper function
+ * is not required, otherwise it calls the command-specific function. */
+int *getKeysFromCommand(struct redisCommand *cmd, robj **argv, int argc, int *numkeys) {
     if (cmd->getkeys_proc) {
-        return cmd->getkeys_proc(cmd,argv,argc,numkeys,flags);
+        return cmd->getkeys_proc(cmd,argv,argc,numkeys);
     } else {
         return getKeysUsingCommandTable(cmd,argv,argc,numkeys);
     }
 }
 
+/* Free the result of getKeysFromCommand. */
 void getKeysFreeResult(int *result) {
     zfree(result);
 }
 
-int *noPreloadGetKeys(struct redisCommand *cmd,robj **argv, int argc, int *numkeys, int flags) {
-    if (flags & REDIS_GETKEYS_PRELOAD) {
-        *numkeys = 0;
-        return NULL;
-    } else {
-        return getKeysUsingCommandTable(cmd,argv,argc,numkeys);
-    }
-}
-
-int *renameGetKeys(struct redisCommand *cmd,robj **argv, int argc, int *numkeys, int flags) {
-    if (flags & REDIS_GETKEYS_PRELOAD) {
-        int *keys = zmalloc(sizeof(int));
-        *numkeys = 1;
-        keys[0] = 1;
-        return keys;
-    } else {
-        return getKeysUsingCommandTable(cmd,argv,argc,numkeys);
-    }
-}
-
-int *zunionInterGetKeys(struct redisCommand *cmd,robj **argv, int argc, int *numkeys, int flags) {
+/* Helper function to extract keys from following commands:
+ * ZUNIONSTORE <destkey> <num-keys> <key> <key> ... <key> <options>
+ * ZINTERSTORE <destkey> <num-keys> <key> <key> ... <key> <options> */
+int *zunionInterGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys) {
     int i, num, *keys;
     REDIS_NOTUSED(cmd);
-    REDIS_NOTUSED(flags);
 
     num = atoi(argv[2]->ptr);
     /* Sanity check. Don't return any key if the command is going to
@@ -985,8 +1027,89 @@ int *zunionInterGetKeys(struct redisCommand *cmd,robj **argv, int argc, int *num
         *numkeys = 0;
         return NULL;
     }
-    keys = zmalloc(sizeof(int)*num);
+
+    /* Keys in z{union,inter}store come from two places:
+     * argv[1] = storage key,
+     * argv[3...n] = keys to intersect */
+    keys = zmalloc(sizeof(int)*(num+1));
+
+    /* Add all key positions for argv[3...n] to keys[] */
     for (i = 0; i < num; i++) keys[i] = 3+i;
+
+    /* Finally add the argv[1] key position (the storage key target). */
+    keys[num] = 1;
+    *numkeys = num+1;  /* Total keys = {union,inter} keys + storage key */
+    return keys;
+}
+
+/* Helper function to extract keys from the following commands:
+ * EVAL <script> <num-keys> <key> <key> ... <key> [more stuff]
+ * EVALSHA <script> <num-keys> <key> <key> ... <key> [more stuff] */
+int *evalGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys) {
+    int i, num, *keys;
+    REDIS_NOTUSED(cmd);
+
+    num = atoi(argv[2]->ptr);
+    /* Sanity check. Don't return any key if the command is going to
+     * reply with syntax error. */
+    if (num > (argc-3)) {
+        *numkeys = 0;
+        return NULL;
+    }
+
+    keys = zmalloc(sizeof(int)*num);
+    *numkeys = num;
+
+    /* Add all key positions for argv[3...n] to keys[] */
+    for (i = 0; i < num; i++) keys[i] = 3+i;
+
+    return keys;
+}
+
+/* Helper function to extract keys from the SORT command.
+ *
+ * SORT <sort-key> ... STORE <store-key> ...
+ *
+ * The first argument of SORT is always a key, however a list of options
+ * follow in SQL-alike style. Here we parse just the minimum in order to
+ * correctly identify keys in the "STORE" option. */
+int *sortGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys) {
+    int i, j, num, *keys;
+    REDIS_NOTUSED(cmd);
+
+    num = 0;
+    keys = zmalloc(sizeof(int)*2); /* Alloc 2 places for the worst case. */
+
+    keys[num++] = 1; /* <sort-key> is always present. */
+
+    /* Search for STORE option. By default we consider options to don't
+     * have arguments, so if we find an unknown option name we scan the
+     * next. However there are options with 1 or 2 arguments, so we
+     * provide a list here in order to skip the right number of args. */
+    struct {
+        char *name;
+        int skip;
+    } skiplist[] = {
+        {"limit", 2},
+        {"get", 1},
+        {"by", 1},
+        {NULL, 0} /* End of elements. */
+    };
+
+    for (i = 2; i < argc; i++) {
+        for (j = 0; skiplist[j].name != NULL; j++) {
+            if (!strcasecmp(argv[i]->ptr,skiplist[j].name)) {
+                i += skiplist[j].skip;
+                break;
+            } else if (!strcasecmp(argv[i]->ptr,"store") && i+1 < argc) {
+                /* Note: we don't increment "num" here and continue the loop
+                 * to be sure to process the *last* "STORE" option if multiple
+                 * ones are provided. This is same behavior as SORT. */
+                keys[num] = i+1; /* <store-key> */
+                break;
+            }
+        }
+    }
     *numkeys = num;
     return keys;
 }

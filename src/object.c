@@ -40,7 +40,7 @@ robj *createObject(int type, void *ptr) {
     o->refcount = 1;
 
     /* Set the LRU to the current lruclock (minutes resolution). */
-    o->lru = server.lruclock;
+    o->lru = LRU_CLOCK();
     return o;
 }
 
@@ -61,7 +61,7 @@ robj *createEmbeddedStringObject(char *ptr, size_t len) {
     o->encoding = REDIS_ENCODING_EMBSTR;
     o->ptr = sh+1;
     o->refcount = 1;
-    o->lru = server.lruclock;
+    o->lru = LRU_CLOCK();
 
     sh->len = len;
     sh->free = 0;
@@ -648,18 +648,19 @@ char *strEncoding(int encoding) {
     }
 }
 
-/* Given an object returns the min number of seconds the object was never
+/* Given an object returns the min number of milliseconds the object was never
  * requested, using an approximated LRU algorithm. */
-unsigned long estimateObjectIdleTime(robj *o) {
-    if (server.lruclock >= o->lru) {
-        return (server.lruclock - o->lru) * REDIS_LRU_CLOCK_RESOLUTION;
+unsigned long long estimateObjectIdleTime(robj *o) {
+    unsigned long long lruclock = LRU_CLOCK();
+    if (lruclock >= o->lru) {
+        return (lruclock - o->lru) * REDIS_LRU_CLOCK_RESOLUTION;
     } else {
-        return ((REDIS_LRU_CLOCK_MAX - o->lru) + server.lruclock) *
+        return (lruclock + (REDIS_LRU_CLOCK_MAX - o->lru)) *
                     REDIS_LRU_CLOCK_RESOLUTION;
     }
 }
 
-/* This is a helper function for the DEBUG command. We need to lookup keys
+/* This is a helper function for the OBJECT command. We need to lookup keys
  * without any modification of LRU or other parameters. */
 robj *objectCommandLookup(redisClient *c, robj *key) {
     dictEntry *de;
@@ -691,7 +692,7 @@ void objectCommand(redisClient *c) {
     } else if (!strcasecmp(c->argv[1]->ptr,"idletime") && c->argc == 3) {
         if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
                 == NULL) return;
-        addReplyLongLong(c,estimateObjectIdleTime(o));
+        addReplyLongLong(c,estimateObjectIdleTime(o)/1000);
     } else {
         addReplyError(c,"Syntax error. Try OBJECT (refcount|encoding|idletime)");
     }

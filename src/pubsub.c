@@ -50,7 +50,7 @@ int listMatchPubsubPattern(void *a, void *b) {
 /* Subscribe a client to a channel. Returns 1 if the operation succeeded, or
  * 0 if the client was already subscribed to that channel. */
 int pubsubSubscribeChannel(redisClient *c, robj *channel) {
-    struct dictEntry *de;
+    dictEntry *de;
     list *clients = NULL;
     int retval = 0;
 
@@ -80,7 +80,7 @@ int pubsubSubscribeChannel(redisClient *c, robj *channel) {
 /* Unsubscribe a client from a channel. Returns 1 if the operation succeeded, or
  * 0 if the client was not subscribed to the specified channel. */
 int pubsubUnsubscribeChannel(redisClient *c, robj *channel, int notify) {
-    struct dictEntry *de;
+    dictEntry *de;
     list *clients;
     listNode *ln;
     int retval = 0;
@@ -218,7 +218,7 @@ int pubsubUnsubscribeAllPatterns(redisClient *c, int notify) {
 /* Publish a message */
 int pubsubPublishMessage(robj *channel, robj *message) {
     int receivers = 0;
-    struct dictEntry *de;
+    dictEntry *de;
     listNode *ln;
     listIter li;
 
@@ -306,8 +306,10 @@ void punsubscribeCommand(redisClient *c) {
 
 void publishCommand(redisClient *c) {
     int receivers = pubsubPublishMessage(c->argv[1],c->argv[2]);
-    if (server.cluster_enabled) clusterPropagatePublish(c->argv[1],c->argv[2]);
-    forceCommandPropagation(c,REDIS_PROPAGATE_REPL);
+    if (server.cluster_enabled)
+        clusterPropagatePublish(c->argv[1],c->argv[2]);
+    else
+        forceCommandPropagation(c,REDIS_PROPAGATE_REPL);
     addReplyLongLong(c,receivers);
 }
 
